@@ -84,7 +84,7 @@ def generate_cc(cs_id, video_path, cc_path):
     update_cc_status(cs_id, "GENERATING")
     model = whisper.load_model(model_type, download_root=models_dir)
     result = model.transcribe(
-        video_path, language="en", task="translate")
+        video_path, language="en", task="translate", fp16=False)
     if not os.path.exists(os.path.dirname(cc_path)):
         os.makedirs(os.path.dirname(cc_path))
     srt_writer = get_writer(subtitle_type, os.path.dirname(cc_path))
