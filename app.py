@@ -7,24 +7,28 @@ import os
 import socket
 import importlib
 import contextlib
+import time
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 queue_name = 'subtitle_gen_queue'
-model_type = 'large'
+model_type = os.getenv("WHISPER_MODEL_TYPE", "large")
 subtitle_type = 'vtt'
 models_dir = './models/'
 hostname = os.getenv("RABBITMQ_HOST")
 rabbitmq_port = int(os.getenv("RABBITMQ_PORT") or 5672)
-username = os.getenv("RABBITMQ_USERNAME")
-password = os.getenv("RABBITMQ_PASSWORD")
+username = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER")
+password = os.getenv("RABBITMQ_PASSWORD") or os.getenv("RABBITMQ_PASS")
 storage_path = os.getenv("STORAGE_PATH", "/data")
 panel_version_default = int(os.getenv("PANEL_VERSION", "1"))
 panel_v1_base_url = os.getenv("PANEL_V1_BASE_URL", "https://panel.videoon.ly").rstrip("/")
 panel_v2_base_url = os.getenv("PANEL_V2_BASE_URL", "https://panelpp.mediatriple.net").rstrip("/")
 panel_v2_status_path = os.getenv("PANEL_V2_STATUS_PATH", "/api/encoder/update-subtitle-status").strip()
 panel_v2_api_key = os.getenv("PANEL_V2_API_KEY") or os.getenv("API_KEY", "")
+rabbitmq_ack_mode = (os.getenv("RABBITMQ_ACK_MODE") or "late").strip().lower()
+duplicate_message_policy = (os.getenv("RABBITMQ_DUPLICATE_POLICY") or "requeue").strip().lower()
+processing_lock_ttl_seconds = int(os.getenv("PROCESSING_LOCK_TTL_SECONDS") or 21600)
 if panel_v2_status_path and not panel_v2_status_path.startswith("/"):
     panel_v2_status_path = f"/{panel_v2_status_path}"
 panel_base_urls = {
@@ -32,6 +36,27 @@ panel_base_urls = {
     2: panel_v2_base_url,
 }
 whisper_model = None
+
+if rabbitmq_ack_mode not in {"late", "early"}:
+    print(
+        f"Invalid RABBITMQ_ACK_MODE '{rabbitmq_ack_mode}'. "
+        "Supported values: 'late', 'early'. Falling back to 'late'."
+    )
+    rabbitmq_ack_mode = "late"
+
+if duplicate_message_policy not in {"requeue", "ack"}:
+    print(
+        f"Invalid RABBITMQ_DUPLICATE_POLICY '{duplicate_message_policy}'. "
+        "Supported values: 'requeue', 'ack'. Falling back to 'requeue'."
+    )
+    duplicate_message_policy = "requeue"
+
+if processing_lock_ttl_seconds <= 0:
+    print(
+        f"Invalid PROCESSING_LOCK_TTL_SECONDS '{processing_lock_ttl_seconds}'. "
+        "It must be greater than 0. Falling back to 21600."
+    )
+    processing_lock_ttl_seconds = 21600
 
 
 def get_rabbitmq_hosts(primary_host):
@@ -43,10 +68,80 @@ def format_error(err):
     return message if message else repr(err)
 
 
+def normalize_path(path):
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return raw_path
+    return os.path.normpath(raw_path)
+
+
+def subtitle_file_exists_and_non_empty(path):
+    try:
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def build_processing_lock_path(cc_path):
+    return f"{cc_path}.lock"
+
+
+def acquire_processing_lock(lock_path, cs_id):
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+
+    lock_payload = json.dumps(
+        {
+            "cs_id": int(cs_id),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "created_at_unix": int(time.time()),
+        }
+    )
+
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+            lock_file.write(lock_payload)
+        return True, "acquired"
+    except FileExistsError:
+        pass
+    except Exception as lock_create_error:
+        return True, f"lock_bypassed_create_error={format_error(lock_create_error)}"
+
+    try:
+        lock_age_seconds = int(time.time() - os.path.getmtime(lock_path))
+    except Exception as lock_age_error:
+        return True, f"lock_bypassed_age_check_error={format_error(lock_age_error)}"
+
+    if lock_age_seconds > processing_lock_ttl_seconds:
+        try:
+            os.remove(lock_path)
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                lock_file.write(lock_payload)
+            return True, f"replaced_stale_lock_age={lock_age_seconds}s"
+        except Exception as stale_lock_error:
+            return False, f"stale_lock_replace_failed={format_error(stale_lock_error)}"
+
+    return False, f"active_lock_age={lock_age_seconds}s"
+
+
+def release_processing_lock(lock_path):
+    try:
+        if lock_path and os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception as lock_release_error:
+        print(f"Warning: Could not remove processing lock '{lock_path}': {format_error(lock_release_error)}")
+
+
 def create_rabbitmq_connection():
     if not hostname or not rabbitmq_port or not username or not password:
         raise RuntimeError(
-            "RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USERNAME ve RABBITMQ_PASSWORD environment değişkenleri tanımlı olmalı."
+            "RABBITMQ_HOST, RABBITMQ_PORT ve kullanıcı/şifre environment değişkenleri tanımlı olmalı. "
+            "Kullanıcı için: RABBITMQ_USERNAME veya RABBITMQ_USER. "
+            "Şifre için: RABBITMQ_PASSWORD veya RABBITMQ_PASS."
         )
 
     last_error = None
@@ -308,19 +403,60 @@ def convert_m3u8_to_m4a(input_file):
 
 
 def on_message_callback(ch, method, properties, body):
+    acked = False
+    should_requeue = False
     parsed_body = None
     panel_version = panel_version_default
+    processing_lock_path = None
+    processing_lock_acquired = False
     try:
-        print("Received message: " + str(body))
+        delivery_tag = getattr(method, "delivery_tag", None)
+        redelivered = getattr(method, "redelivered", False)
+        print(
+            "Received message "
+            f"(delivery_tag={delivery_tag}, redelivered={redelivered}, ack_mode={rabbitmq_ack_mode}): "
+            + str(body)
+        )
+        if rabbitmq_ack_mode == "early":
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            acked = True
+            print(f"Message acknowledged early (delivery_tag={delivery_tag})")
+
         parsed_body = json.loads(body)
         cs_id = parsed_body["cs_id"]
         content_id = parsed_body["content_id"]
         vod_type = parsed_body["vod_type"]
         cs_path = parsed_body["cs_path"]
         lowest_resolution = parsed_body["lowest_resolution"]
-        cc_path = parsed_body["cc_path"]
+        cc_path = normalize_path(parsed_body["cc_path"])
         user_id = parsed_body["user_id"]
         panel_version = parsed_body.get("panel_version", panel_version_default)
+
+        if subtitle_file_exists_and_non_empty(cc_path):
+            print(
+                f"Detected existing subtitle output for cs_id={cs_id} at '{cc_path}'. "
+                "Skipping transcription for idempotency."
+            )
+            update_cc_status(
+                cs_id,
+                "GENERATED",
+                panel_version,
+                subtitle_file_path=cc_path,
+                progress_percentage=100,
+            )
+            return
+
+        processing_lock_path = build_processing_lock_path(cc_path)
+        processing_lock_acquired, lock_reason = acquire_processing_lock(processing_lock_path, cs_id)
+        if not processing_lock_acquired:
+            print(
+                f"Duplicate/in-progress message detected for cs_id={cs_id}. "
+                f"lock='{processing_lock_path}', reason={lock_reason}, policy={duplicate_message_policy}"
+            )
+            if duplicate_message_policy == "requeue" and not acked:
+                should_requeue = True
+            return
+
         if vod_type == "ts":
             low_res_m3u8_video_path = f"{storage_path}/{user_id}/{content_id}/{lowest_resolution}p.m3u8"
             generate_cc(cs_id, convert_m3u8_to_m4a(
@@ -348,8 +484,16 @@ def on_message_callback(ch, method, properties, body):
                 error_message=format_error(e),
             )
     finally:
-        # Fair dispatch: acknowledge only after processing completes.
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        if processing_lock_acquired:
+            release_processing_lock(processing_lock_path)
+
+        if not acked:
+            if should_requeue:
+                print("Requeueing duplicate/in-progress message.")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            else:
+                # Fair dispatch: acknowledge only after processing completes.
+                ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
 def start_consuming():
@@ -360,7 +504,7 @@ def start_consuming():
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(
         queue=queue_name, on_message_callback=on_message_callback, auto_ack=False)
-    print("Waiting for messages...")
+    print(f"Waiting for messages... (queue={queue_name}, ack_mode={rabbitmq_ack_mode})")
     channel.start_consuming()
 
 
