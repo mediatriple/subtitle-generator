@@ -5,6 +5,7 @@ import pika
 import json
 import os
 import socket
+import importlib
 import contextlib
 import requests
 from urllib3.exceptions import InsecureRequestWarning
@@ -94,11 +95,52 @@ def preload_model():
     return whisper_model
 
 
+def transcribe_with_progress(model, video_path):
+    transcribe_module = importlib.import_module("whisper.transcribe")
+    original_tqdm = transcribe_module.tqdm.tqdm
+
+    class PercentTqdm:
+        def __init__(self, *args, **kwargs):
+            self.total = kwargs.get("total") or 0
+            self.current = 0
+            self.last_percent = -1
+
+        def __enter__(self):
+            print("Transcription progress: 0%")
+            self.last_percent = 0
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def update(self, n=1):
+            self.current += n
+            if not self.total:
+                return
+            percent = int(min(100, (self.current * 100) / self.total))
+            if percent > self.last_percent:
+                self.last_percent = percent
+                print(f"Transcription progress: {percent}%")
+
+    transcribe_module.tqdm.tqdm = PercentTqdm
+    try:
+        result = model.transcribe(
+            video_path,
+            language="en",
+            task="translate",
+            fp16=False,
+            verbose=False,
+        )
+        print("Transcription progress: 100%")
+        return result
+    finally:
+        transcribe_module.tqdm.tqdm = original_tqdm
+
+
 def generate_cc(cs_id, video_path, cc_path):
     update_cc_status(cs_id, "GENERATING")
     model = preload_model()
-    result = model.transcribe(
-        video_path, language="en", task="translate", fp16=False)
+    result = transcribe_with_progress(model, video_path)
     if not os.path.exists(os.path.dirname(cc_path)):
         os.makedirs(os.path.dirname(cc_path))
     srt_writer = get_writer(subtitle_type, os.path.dirname(cc_path))
