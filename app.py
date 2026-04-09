@@ -23,6 +23,10 @@ storage_path = os.getenv("STORAGE_PATH", "/data")
 panel_version_default = int(os.getenv("PANEL_VERSION", "1"))
 panel_v1_base_url = os.getenv("PANEL_V1_BASE_URL", "https://panel.videoon.ly").rstrip("/")
 panel_v2_base_url = os.getenv("PANEL_V2_BASE_URL", "https://panelpp.mediatriple.net").rstrip("/")
+panel_v2_status_path = os.getenv("PANEL_V2_STATUS_PATH", "/api/encoder/update-subtitle-status").strip()
+panel_v2_api_key = os.getenv("PANEL_V2_API_KEY", "")
+if panel_v2_status_path and not panel_v2_status_path.startswith("/"):
+    panel_v2_status_path = f"/{panel_v2_status_path}"
 panel_base_urls = {
     1: panel_v1_base_url,
     2: panel_v2_base_url,
@@ -90,15 +94,78 @@ def resolve_panel_version(panel_version):
         return panel_version_default
 
 
-def update_cc_status(cs_id, status, panel_version=None):
+def map_status_for_panel_v2(status):
+    normalized_status = str(status or "").strip().upper()
+    status_map = {
+        "IN_QUEUE": "queued",
+        "QUEUED": "queued",
+        "GENERATING": "generating",
+        "GENERATED": "ready",
+        "READY": "ready",
+        "ERROR": "error",
+    }
+    return status_map.get(normalized_status, "error")
+
+
+def update_cc_status_panel_v1(cs_id, status, base_url):
+    status_url = f"{base_url}/encoders/update_cc_status/{cs_id}/{status}"
+    print(f"Updating CC status via panel v1: {status_url}")
+    return requests.get(status_url, verify=False, timeout=10)
+
+
+def update_cc_status_panel_v2(cs_id, status, base_url, subtitle_file_path=None, error_message=None):
+    status_url = f"{base_url}{panel_v2_status_path}"
+    payload = {
+        "subtitle_id": int(cs_id),
+        "status": map_status_for_panel_v2(status),
+    }
+
+    if payload["status"] == "ready":
+        if not subtitle_file_path or not os.path.exists(subtitle_file_path):
+            raise FileNotFoundError(f"Subtitle file not found for panel v2 upload: {subtitle_file_path}")
+        with open(subtitle_file_path, "r", encoding="utf-8") as subtitle_file:
+            payload["subtitle_content"] = subtitle_file.read()
+    elif payload["status"] == "error" and error_message:
+        payload["error_message"] = str(error_message)
+
+    headers = {"Accept": "application/json"}
+    if panel_v2_api_key:
+        headers["X-API-KEY"] = panel_v2_api_key
+    else:
+        print("Warning: PANEL_V2_API_KEY is not set; panel v2 request may be unauthorized.")
+
+    print(f"Updating CC status via panel v2: {status_url} ({payload['status']})")
+    response = requests.post(
+        status_url,
+        json=payload,
+        headers=headers,
+        verify=False,
+        timeout=30,
+    )
+    print(f"Panel v2 response: {response.status_code}")
+    return response
+
+
+def update_cc_status(cs_id, status, panel_version=None, subtitle_file_path=None, error_message=None):
     resolved_panel_version = resolve_panel_version(panel_version)
     base_url = panel_base_urls.get(
         resolved_panel_version,
         panel_base_urls.get(panel_version_default, panel_v1_base_url),
     )
-    status_url = f"{base_url}/encoders/update_cc_status/{cs_id}/{status}"
-    print(f"Updating CC status via panel v{resolved_panel_version}: {status_url}")
-    return requests.get(status_url, verify=False, timeout=10)
+
+    try:
+        if resolved_panel_version == 2:
+            return update_cc_status_panel_v2(
+                cs_id=cs_id,
+                status=status,
+                base_url=base_url,
+                subtitle_file_path=subtitle_file_path,
+                error_message=error_message,
+            )
+        return update_cc_status_panel_v1(cs_id=cs_id, status=status, base_url=base_url)
+    except Exception as panel_error:
+        print(f"Status update failed: {format_error(panel_error)}")
+        return None
 
 
 def get_filename(path): return os.path.splitext(os.path.basename(path))[0]
@@ -168,7 +235,7 @@ def generate_cc(cs_id, video_path, cc_path, panel_version):
     srt_writer(
         result, os.path.basename(cc_path))
     print(f"Subtitles generated for {video_path}")
-    update_cc_status(cs_id, "GENERATED", panel_version)
+    update_cc_status(cs_id, "GENERATED", panel_version, subtitle_file_path=cc_path)
 
 
 def convert_m3u8_to_m4a(input_file):
@@ -210,14 +277,19 @@ def on_message_callback(ch, method, properties, body):
                 generate_cc(cs_id, uploaded_video_path, cc_path, panel_version)
             else:
                 print("Error occured: Video file not found")
-                update_cc_status(cs_id, "ERROR", panel_version)
+                update_cc_status(cs_id, "ERROR", panel_version, error_message="Video file not found")
         else:
             print(f"Error occured: Unsupported vod_type '{vod_type}'")
-            update_cc_status(cs_id, "ERROR", panel_version)
+            update_cc_status(cs_id, "ERROR", panel_version, error_message=f"Unsupported vod_type '{vod_type}'")
     except Exception as e:
         print("Error occured: " + str(e))
         if isinstance(parsed_body, dict) and "cs_id" in parsed_body:
-            update_cc_status(parsed_body["cs_id"], "ERROR", parsed_body.get("panel_version", panel_version))
+            update_cc_status(
+                parsed_body["cs_id"],
+                "ERROR",
+                parsed_body.get("panel_version", panel_version),
+                error_message=format_error(e),
+            )
     finally:
         # Fair dispatch: acknowledge only after processing completes.
         ch.basic_ack(delivery_tag=method.delivery_tag)
