@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+models
+*.mp4
+*.m3u8
+*.m4a
+*.vtt
+*.srt
