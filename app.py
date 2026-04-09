@@ -24,7 +24,7 @@ panel_version_default = int(os.getenv("PANEL_VERSION", "1"))
 panel_v1_base_url = os.getenv("PANEL_V1_BASE_URL", "https://panel.videoon.ly").rstrip("/")
 panel_v2_base_url = os.getenv("PANEL_V2_BASE_URL", "https://panelpp.mediatriple.net").rstrip("/")
 panel_v2_status_path = os.getenv("PANEL_V2_STATUS_PATH", "/api/encoder/update-subtitle-status").strip()
-panel_v2_api_key = os.getenv("PANEL_V2_API_KEY", "")
+panel_v2_api_key = os.getenv("PANEL_V2_API_KEY") or os.getenv("API_KEY", "")
 if panel_v2_status_path and not panel_v2_status_path.startswith("/"):
     panel_v2_status_path = f"/{panel_v2_status_path}"
 panel_base_urls = {
@@ -113,12 +113,35 @@ def update_cc_status_panel_v1(cs_id, status, base_url):
     return requests.get(status_url, verify=False, timeout=10)
 
 
-def update_cc_status_panel_v2(cs_id, status, base_url, subtitle_file_path=None, error_message=None):
+def normalize_progress_percentage(progress_percentage):
+    try:
+        value = float(progress_percentage)
+    except (TypeError, ValueError):
+        return None
+
+    if value < 0:
+        return 0.0
+    if value > 100:
+        return 100.0
+    return round(value, 2)
+
+
+def update_cc_status_panel_v2(
+    cs_id,
+    status,
+    base_url,
+    subtitle_file_path=None,
+    error_message=None,
+    progress_percentage=None,
+):
     status_url = f"{base_url}{panel_v2_status_path}"
     payload = {
         "subtitle_id": int(cs_id),
         "status": map_status_for_panel_v2(status),
     }
+    normalized_progress = normalize_progress_percentage(progress_percentage)
+    if normalized_progress is not None:
+        payload["progress_percentage"] = normalized_progress
 
     if payload["status"] == "ready":
         if not subtitle_file_path or not os.path.exists(subtitle_file_path):
@@ -143,10 +166,19 @@ def update_cc_status_panel_v2(cs_id, status, base_url, subtitle_file_path=None, 
         timeout=30,
     )
     print(f"Panel v2 response: {response.status_code}")
+    if not response.ok:
+        print(f"Panel v2 response body: {response.text[:500]}")
     return response
 
 
-def update_cc_status(cs_id, status, panel_version=None, subtitle_file_path=None, error_message=None):
+def update_cc_status(
+    cs_id,
+    status,
+    panel_version=None,
+    subtitle_file_path=None,
+    error_message=None,
+    progress_percentage=None,
+):
     resolved_panel_version = resolve_panel_version(panel_version)
     base_url = panel_base_urls.get(
         resolved_panel_version,
@@ -161,6 +193,7 @@ def update_cc_status(cs_id, status, panel_version=None, subtitle_file_path=None,
                 base_url=base_url,
                 subtitle_file_path=subtitle_file_path,
                 error_message=error_message,
+                progress_percentage=progress_percentage,
             )
         return update_cc_status_panel_v1(cs_id=cs_id, status=status, base_url=base_url)
     except Exception as panel_error:
@@ -183,7 +216,7 @@ def preload_model():
     return whisper_model
 
 
-def transcribe_with_progress(model, video_path):
+def transcribe_with_progress(model, video_path, on_progress=None):
     transcribe_module = importlib.import_module("whisper.transcribe")
     original_tqdm = transcribe_module.tqdm.tqdm
 
@@ -196,6 +229,8 @@ def transcribe_with_progress(model, video_path):
         def __enter__(self):
             print("Transcription progress: 0%")
             self.last_percent = 0
+            if callable(on_progress):
+                on_progress(0)
             return self
 
         def __exit__(self, exc_type, exc_value, traceback):
@@ -209,6 +244,8 @@ def transcribe_with_progress(model, video_path):
             if percent > self.last_percent:
                 self.last_percent = percent
                 print(f"Transcription progress: {percent}%")
+                if callable(on_progress):
+                    on_progress(percent)
 
     transcribe_module.tqdm.tqdm = PercentTqdm
     try:
@@ -220,22 +257,42 @@ def transcribe_with_progress(model, video_path):
             verbose=False,
         )
         print("Transcription progress: 100%")
+        if callable(on_progress):
+            on_progress(100)
         return result
     finally:
         transcribe_module.tqdm.tqdm = original_tqdm
 
 
 def generate_cc(cs_id, video_path, cc_path, panel_version):
-    update_cc_status(cs_id, "GENERATING", panel_version)
+    resolved_panel_version = resolve_panel_version(panel_version)
+    update_cc_status(cs_id, "GENERATING", panel_version, progress_percentage=0)
+
+    def on_progress(percent):
+        if resolved_panel_version != 2:
+            return
+        update_cc_status(
+            cs_id,
+            "GENERATING",
+            panel_version,
+            progress_percentage=percent,
+        )
+
     model = preload_model()
-    result = transcribe_with_progress(model, video_path)
+    result = transcribe_with_progress(model, video_path, on_progress=on_progress)
     if not os.path.exists(os.path.dirname(cc_path)):
         os.makedirs(os.path.dirname(cc_path))
     srt_writer = get_writer(subtitle_type, os.path.dirname(cc_path))
     srt_writer(
         result, os.path.basename(cc_path))
     print(f"Subtitles generated for {video_path}")
-    update_cc_status(cs_id, "GENERATED", panel_version, subtitle_file_path=cc_path)
+    update_cc_status(
+        cs_id,
+        "GENERATED",
+        panel_version,
+        subtitle_file_path=cc_path,
+        progress_percentage=100,
+    )
 
 
 def convert_m3u8_to_m4a(input_file):
