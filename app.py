@@ -18,6 +18,7 @@ rabbitmq_port = int(os.getenv("RABBITMQ_PORT") or 5672)
 username = os.getenv("RABBITMQ_USERNAME")
 password = os.getenv("RABBITMQ_PASSWORD")
 storage_path = os.getenv("STORAGE_PATH", "/data")
+whisper_model = None
 
 
 def get_rabbitmq_hosts(primary_host):
@@ -80,9 +81,19 @@ def update_cc_status(cs_id, status): return requests.get(
 def get_filename(path): return os.path.splitext(os.path.basename(path))[0]
 
 
+def preload_model():
+    global whisper_model
+    if whisper_model is None:
+        os.makedirs(models_dir, exist_ok=True)
+        print(f"Loading Whisper model '{model_type}' to '{models_dir}'...")
+        whisper_model = whisper.load_model(model_type, download_root=models_dir)
+        print(f"Whisper model '{model_type}' is ready.")
+    return whisper_model
+
+
 def generate_cc(cs_id, video_path, cc_path):
     update_cc_status(cs_id, "GENERATING")
-    model = whisper.load_model(model_type, download_root=models_dir)
+    model = preload_model()
     result = model.transcribe(
         video_path, language="en", task="translate", fp16=False)
     if not os.path.exists(os.path.dirname(cc_path)):
@@ -158,6 +169,7 @@ def start_consuming():
 
 if __name__ == "__main__":
     try:
+        preload_model()
         start_consuming()
     except Exception as e:
         print("Error occured: " + str(e))
