@@ -20,6 +20,13 @@ rabbitmq_port = int(os.getenv("RABBITMQ_PORT") or 5672)
 username = os.getenv("RABBITMQ_USERNAME")
 password = os.getenv("RABBITMQ_PASSWORD")
 storage_path = os.getenv("STORAGE_PATH", "/data")
+panel_version_default = int(os.getenv("PANEL_VERSION", "1"))
+panel_v1_base_url = os.getenv("PANEL_V1_BASE_URL", "https://panel.videoon.ly").rstrip("/")
+panel_v2_base_url = os.getenv("PANEL_V2_BASE_URL", "https://panelpp.mediatriple.net").rstrip("/")
+panel_base_urls = {
+    1: panel_v1_base_url,
+    2: panel_v2_base_url,
+}
 whisper_model = None
 
 
@@ -76,8 +83,22 @@ def create_rabbitmq_connection():
     )
 
 
-def update_cc_status(cs_id, status): return requests.get(
-    f"https://panel.videoon.ly/encoders/update_cc_status/{cs_id}/{status}", verify=False)
+def resolve_panel_version(panel_version):
+    try:
+        return int(panel_version)
+    except (TypeError, ValueError):
+        return panel_version_default
+
+
+def update_cc_status(cs_id, status, panel_version=None):
+    resolved_panel_version = resolve_panel_version(panel_version)
+    base_url = panel_base_urls.get(
+        resolved_panel_version,
+        panel_base_urls.get(panel_version_default, panel_v1_base_url),
+    )
+    status_url = f"{base_url}/encoders/update_cc_status/{cs_id}/{status}"
+    print(f"Updating CC status via panel v{resolved_panel_version}: {status_url}")
+    return requests.get(status_url, verify=False, timeout=10)
 
 
 def get_filename(path): return os.path.splitext(os.path.basename(path))[0]
@@ -137,8 +158,8 @@ def transcribe_with_progress(model, video_path):
         transcribe_module.tqdm.tqdm = original_tqdm
 
 
-def generate_cc(cs_id, video_path, cc_path):
-    update_cc_status(cs_id, "GENERATING")
+def generate_cc(cs_id, video_path, cc_path, panel_version):
+    update_cc_status(cs_id, "GENERATING", panel_version)
     model = preload_model()
     result = transcribe_with_progress(model, video_path)
     if not os.path.exists(os.path.dirname(cc_path)):
@@ -147,7 +168,7 @@ def generate_cc(cs_id, video_path, cc_path):
     srt_writer(
         result, os.path.basename(cc_path))
     print(f"Subtitles generated for {video_path}")
-    update_cc_status(cs_id, "GENERATED")
+    update_cc_status(cs_id, "GENERATED", panel_version)
 
 
 def convert_m3u8_to_m4a(input_file):
@@ -164,6 +185,7 @@ def convert_m3u8_to_m4a(input_file):
 
 def on_message_callback(ch, method, properties, body):
     parsed_body = None
+    panel_version = panel_version_default
     try:
         print("Received message: " + str(body))
         parsed_body = json.loads(body)
@@ -174,27 +196,28 @@ def on_message_callback(ch, method, properties, body):
         lowest_resolution = parsed_body["lowest_resolution"]
         cc_path = parsed_body["cc_path"]
         user_id = parsed_body["user_id"]
+        panel_version = parsed_body.get("panel_version", panel_version_default)
         if vod_type == "ts":
             low_res_m3u8_video_path = f"{storage_path}/{user_id}/{content_id}/{lowest_resolution}p.m3u8"
             generate_cc(cs_id, convert_m3u8_to_m4a(
-                low_res_m3u8_video_path), cc_path)
+                low_res_m3u8_video_path), cc_path, panel_version)
         elif vod_type == "mp4":
             low_res_mp4_video_path = f"{storage_path}/{user_id}/{get_filename(cs_path)}_{lowest_resolution}.mp4"
             uploaded_video_path = f"{storage_path}/{user_id}/{cs_path}"
             if os.path.exists(low_res_mp4_video_path):
-                generate_cc(cs_id, low_res_mp4_video_path, cc_path)
+                generate_cc(cs_id, low_res_mp4_video_path, cc_path, panel_version)
             elif os.path.exists(uploaded_video_path):
-                generate_cc(cs_id, uploaded_video_path, cc_path)
+                generate_cc(cs_id, uploaded_video_path, cc_path, panel_version)
             else:
                 print("Error occured: Video file not found")
-                update_cc_status(cs_id, "ERROR")
+                update_cc_status(cs_id, "ERROR", panel_version)
         else:
             print(f"Error occured: Unsupported vod_type '{vod_type}'")
-            update_cc_status(cs_id, "ERROR")
+            update_cc_status(cs_id, "ERROR", panel_version)
     except Exception as e:
         print("Error occured: " + str(e))
         if isinstance(parsed_body, dict) and "cs_id" in parsed_body:
-            update_cc_status(parsed_body["cs_id"], "ERROR")
+            update_cc_status(parsed_body["cs_id"], "ERROR", parsed_body.get("panel_version", panel_version))
     finally:
         # Fair dispatch: acknowledge only after processing completes.
         ch.basic_ack(delivery_tag=method.delivery_tag)
