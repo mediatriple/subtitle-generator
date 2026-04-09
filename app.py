@@ -5,6 +5,7 @@ import pika
 import json
 import os
 import socket
+import contextlib
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -86,7 +87,9 @@ def preload_model():
     if whisper_model is None:
         os.makedirs(models_dir, exist_ok=True)
         print(f"Loading Whisper model '{model_type}' to '{models_dir}'...")
-        whisper_model = whisper.load_model(model_type, download_root=models_dir)
+        # Suppress Whisper's tqdm download progress in pod logs.
+        with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+            whisper_model = whisper.load_model(model_type, download_root=models_dir)
         print(f"Whisper model '{model_type}' is ready.")
     return whisper_model
 
