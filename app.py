@@ -107,6 +107,7 @@ def convert_m3u8_to_m4a(input_file):
 
 
 def on_message_callback(ch, method, properties, body):
+    parsed_body = None
     try:
         print("Received message: " + str(body))
         parsed_body = json.loads(body)
@@ -131,17 +132,26 @@ def on_message_callback(ch, method, properties, body):
             else:
                 print("Error occured: Video file not found")
                 update_cc_status(cs_id, "ERROR")
+        else:
+            print(f"Error occured: Unsupported vod_type '{vod_type}'")
+            update_cc_status(cs_id, "ERROR")
     except Exception as e:
         print("Error occured: " + str(e))
-        update_cc_status(parsed_body["cs_id"], "ERROR")
+        if isinstance(parsed_body, dict) and "cs_id" in parsed_body:
+            update_cc_status(parsed_body["cs_id"], "ERROR")
+    finally:
+        # Fair dispatch: acknowledge only after processing completes.
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
 def start_consuming():
     connection = create_rabbitmq_connection()
     channel = connection.channel()
     channel.queue_declare(queue=queue_name)
+    # Process one unacked message at a time per consumer for balanced load.
+    channel.basic_qos(prefetch_count=1)
     channel.basic_consume(
-        queue=queue_name, on_message_callback=on_message_callback, auto_ack=True)
+        queue=queue_name, on_message_callback=on_message_callback, auto_ack=False)
     print("Waiting for messages...")
     channel.start_consuming()
 
