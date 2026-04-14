@@ -346,8 +346,7 @@ def transcribe_with_progress(model, video_path, on_progress=None):
     try:
         result = model.transcribe(
             video_path,
-            language="en",
-            task="translate",
+            task="transcribe",
             fp16=False,
             verbose=False,
         )
