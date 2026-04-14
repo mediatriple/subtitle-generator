@@ -452,8 +452,13 @@ def on_message_callback(ch, method, properties, body):
                 f"Duplicate/in-progress message detected for cs_id={cs_id}. "
                 f"lock='{processing_lock_path}', reason={lock_reason}, policy={duplicate_message_policy}"
             )
-            if duplicate_message_policy == "requeue" and not acked:
+            if duplicate_message_policy == "requeue" and not acked and not redelivered:
                 should_requeue = True
+            elif duplicate_message_policy == "requeue" and redelivered:
+                print(
+                    f"Skipping requeue for redelivered duplicate message (cs_id={cs_id}) "
+                    "to avoid hot requeue loop."
+                )
             return
 
         if vod_type == "ts":
