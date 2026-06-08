@@ -8,14 +8,18 @@ import socket
 import importlib
 import contextlib
 import time
+import shutil
 import requests
+from urllib.parse import urlparse
 from urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 queue_name = 'subtitle_gen_queue'
 model_type = os.getenv("WHISPER_MODEL_TYPE", "large")
 subtitle_type = 'vtt'
-models_dir = './models/'
+models_dir = os.getenv("WHISPER_MODEL_CACHE_DIR", "./models/")
+model_path_override = os.getenv("WHISPER_MODEL_PATH", "")
+model_seed_dir = os.getenv("WHISPER_MODEL_SEED_DIR", "")
 hostname = os.getenv("RABBITMQ_HOST")
 rabbitmq_port = int(os.getenv("RABBITMQ_PORT") or 5672)
 username = os.getenv("RABBITMQ_USERNAME") or os.getenv("RABBITMQ_USER")
@@ -29,6 +33,7 @@ panel_v2_api_key = os.getenv("PANEL_V2_API_KEY") or os.getenv("API_KEY", "")
 rabbitmq_ack_mode = (os.getenv("RABBITMQ_ACK_MODE") or "late").strip().lower()
 duplicate_message_policy = (os.getenv("RABBITMQ_DUPLICATE_POLICY") or "requeue").strip().lower()
 processing_lock_ttl_seconds = int(os.getenv("PROCESSING_LOCK_TTL_SECONDS") or 21600)
+model_cache_lock_ttl_seconds = int(os.getenv("MODEL_CACHE_LOCK_TTL_SECONDS") or 1800)
 if panel_v2_status_path and not panel_v2_status_path.startswith("/"):
     panel_v2_status_path = f"/{panel_v2_status_path}"
 panel_base_urls = {
@@ -58,6 +63,13 @@ if processing_lock_ttl_seconds <= 0:
     )
     processing_lock_ttl_seconds = 21600
 
+if model_cache_lock_ttl_seconds <= 0:
+    print(
+        f"Invalid MODEL_CACHE_LOCK_TTL_SECONDS '{model_cache_lock_ttl_seconds}'. "
+        "It must be greater than 0. Falling back to 1800."
+    )
+    model_cache_lock_ttl_seconds = 1800
+
 
 def get_rabbitmq_hosts(primary_host):
     return [primary_host]
@@ -72,7 +84,7 @@ def normalize_path(path):
     raw_path = str(path or "").strip()
     if not raw_path:
         return raw_path
-    return os.path.normpath(raw_path)
+    return os.path.normpath(os.path.expanduser(raw_path))
 
 
 def subtitle_file_exists_and_non_empty(path):
@@ -82,23 +94,33 @@ def subtitle_file_exists_and_non_empty(path):
         return False
 
 
+def file_exists_and_non_empty(path):
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def build_processing_lock_path(cc_path):
     return f"{cc_path}.lock"
 
 
-def acquire_processing_lock(lock_path, cs_id):
+def acquire_lock(lock_path, owner_payload, ttl_seconds):
     lock_dir = os.path.dirname(lock_path)
     if lock_dir:
         os.makedirs(lock_dir, exist_ok=True)
 
-    lock_payload = json.dumps(
-        {
-            "cs_id": int(cs_id),
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "created_at_unix": int(time.time()),
-        }
-    )
+    lock_data = {
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "created_at_unix": int(time.time()),
+    }
+    if isinstance(owner_payload, dict):
+        lock_data.update(owner_payload)
+    else:
+        lock_data["owner"] = str(owner_payload)
+
+    lock_payload = json.dumps(lock_data)
 
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -115,7 +137,7 @@ def acquire_processing_lock(lock_path, cs_id):
     except Exception as lock_age_error:
         return True, f"lock_bypassed_age_check_error={format_error(lock_age_error)}"
 
-    if lock_age_seconds > processing_lock_ttl_seconds:
+    if lock_age_seconds > ttl_seconds:
         try:
             os.remove(lock_path)
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -128,12 +150,27 @@ def acquire_processing_lock(lock_path, cs_id):
     return False, f"active_lock_age={lock_age_seconds}s"
 
 
-def release_processing_lock(lock_path):
+def acquire_processing_lock(lock_path, cs_id):
+    return acquire_lock(
+        lock_path,
+        {
+            "lock_type": "processing",
+            "cs_id": int(cs_id),
+        },
+        processing_lock_ttl_seconds,
+    )
+
+
+def release_lock(lock_path):
     try:
         if lock_path and os.path.exists(lock_path):
             os.remove(lock_path)
     except Exception as lock_release_error:
-        print(f"Warning: Could not remove processing lock '{lock_path}': {format_error(lock_release_error)}")
+        print(f"Warning: Could not remove lock '{lock_path}': {format_error(lock_release_error)}")
+
+
+def release_processing_lock(lock_path):
+    release_lock(lock_path)
 
 
 def create_rabbitmq_connection():
@@ -299,14 +336,179 @@ def update_cc_status(
 def get_filename(path): return os.path.splitext(os.path.basename(path))[0]
 
 
+def get_model_cache_dir():
+    return normalize_path(models_dir)
+
+
+def get_model_url(model_name):
+    return getattr(whisper, "_MODELS", {}).get(model_name)
+
+
+def get_expected_model_filename(model_name):
+    model_url = get_model_url(model_name)
+    if not model_url:
+        return None
+    return os.path.basename(urlparse(model_url).path)
+
+
+def get_cached_model_path(model_name):
+    expected_filename = get_expected_model_filename(model_name)
+    if not expected_filename:
+        return None
+    return os.path.join(get_model_cache_dir(), expected_filename)
+
+
+def resolve_model_path_override(model_name):
+    configured_path = normalize_path(model_path_override)
+    if not configured_path:
+        return None
+
+    if file_exists_and_non_empty(configured_path):
+        return configured_path
+
+    if os.path.isdir(configured_path):
+        expected_filename = get_expected_model_filename(model_name)
+        if expected_filename:
+            candidate_path = os.path.join(configured_path, expected_filename)
+            if file_exists_and_non_empty(candidate_path):
+                return candidate_path
+
+    print(
+        f"Configured WHISPER_MODEL_PATH '{configured_path}' was not found, is empty, "
+        f"or does not contain the expected checkpoint for '{model_name}'. Falling back."
+    )
+    return None
+
+
+def resolve_seed_model_path(model_name):
+    seed_dir = normalize_path(model_seed_dir)
+    if not seed_dir:
+        return None
+
+    expected_filename = get_expected_model_filename(model_name)
+    if not expected_filename:
+        print(
+            f"Seed directory lookup skipped for model '{model_name}' because "
+            "it does not have an official checkpoint filename mapping."
+        )
+        return None
+
+    candidate_path = os.path.join(seed_dir, expected_filename)
+    if file_exists_and_non_empty(candidate_path):
+        return candidate_path
+
+    print(
+        f"No seed checkpoint found for '{model_name}' in '{seed_dir}'. "
+        f"Expected file: '{expected_filename}'."
+    )
+    return None
+
+
+def build_model_cache_lock_path(model_name):
+    safe_model_name = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "_"
+        for character in str(model_name or "whisper-model")
+    )
+    return os.path.join(get_model_cache_dir(), f".{safe_model_name}.lock")
+
+
+def acquire_model_cache_lock(lock_path, model_name):
+    return acquire_lock(
+        lock_path,
+        {
+            "lock_type": "model_cache",
+            "model_type": str(model_name),
+        },
+        model_cache_lock_ttl_seconds,
+    )
+
+
+def wait_for_cached_model(cached_model_path, timeout_seconds):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if file_exists_and_non_empty(cached_model_path):
+            return True
+        time.sleep(2)
+    return file_exists_and_non_empty(cached_model_path)
+
+
+def copy_seed_model_to_cache(seed_model_path, cached_model_path):
+    os.makedirs(os.path.dirname(cached_model_path), exist_ok=True)
+    if file_exists_and_non_empty(cached_model_path):
+        return cached_model_path
+
+    temporary_path = f"{cached_model_path}.tmp.{os.getpid()}"
+    print(f"Priming Whisper cache: '{seed_model_path}' -> '{cached_model_path}'")
+    try:
+        shutil.copy2(seed_model_path, temporary_path)
+        os.replace(temporary_path, cached_model_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+    return cached_model_path
+
+
+def ensure_model_cached(model_name):
+    cached_model_path = get_cached_model_path(model_name)
+    if not cached_model_path:
+        return False
+
+    os.makedirs(get_model_cache_dir(), exist_ok=True)
+    if file_exists_and_non_empty(cached_model_path):
+        return True
+
+    lock_path = build_model_cache_lock_path(model_name)
+    lock_acquired, lock_reason = acquire_model_cache_lock(lock_path, model_name)
+
+    if not lock_acquired:
+        print(
+            f"Whisper cache lock is busy for '{model_name}' ({lock_reason}). "
+            f"Waiting for '{cached_model_path}' to appear."
+        )
+        if wait_for_cached_model(cached_model_path, model_cache_lock_ttl_seconds):
+            print(f"Whisper cache became available for '{model_name}'.")
+            return True
+        print(
+            f"Timed out waiting for cached Whisper model '{model_name}'. "
+            "Continuing with normal Whisper load flow."
+        )
+        return False
+
+    try:
+        if file_exists_and_non_empty(cached_model_path):
+            return True
+
+        seed_model_path = resolve_seed_model_path(model_name)
+        if seed_model_path:
+            copy_seed_model_to_cache(seed_model_path, cached_model_path)
+            return True
+
+        return False
+    finally:
+        release_lock(lock_path)
+
+
 def preload_model():
     global whisper_model
     if whisper_model is None:
-        os.makedirs(models_dir, exist_ok=True)
-        print(f"Loading Whisper model '{model_type}' to '{models_dir}'...")
+        model_path = resolve_model_path_override(model_type)
+        if model_path:
+            print(f"Loading Whisper model '{model_type}' from explicit path '{model_path}'...")
+            with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+                whisper_model = whisper.load_model(model_path)
+            print(f"Whisper model '{model_type}' is ready from explicit path.")
+            return whisper_model
+
+        cache_ready = ensure_model_cached(model_type)
+        cache_dir = get_model_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        if cache_ready:
+            print(f"Loading Whisper model '{model_type}' from cache directory '{cache_dir}'...")
+        else:
+            print(f"Loading Whisper model '{model_type}' using cache directory '{cache_dir}'...")
         # Suppress Whisper's tqdm download progress in pod logs.
         with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
-            whisper_model = whisper.load_model(model_type, download_root=models_dir)
+            whisper_model = whisper.load_model(model_type, download_root=cache_dir)
         print(f"Whisper model '{model_type}' is ready.")
     return whisper_model
 
@@ -428,7 +630,7 @@ def on_message_callback(ch, method, properties, body):
         cs_path = parsed_body["cs_path"]
         lowest_resolution = parsed_body["lowest_resolution"]
         cc_path = normalize_path(parsed_body["cc_path"])
-        user_id = parsed_body["user_id"]
+        encoder_folder = parsed_body["encoderFolder"]
         panel_version = parsed_body.get("panel_version", panel_version_default)
 
         if subtitle_file_exists_and_non_empty(cc_path):
@@ -462,12 +664,12 @@ def on_message_callback(ch, method, properties, body):
             return
 
         if vod_type == "ts":
-            low_res_m3u8_video_path = f"{storage_path}/{user_id}/{content_id}/{lowest_resolution}p.m3u8"
+            low_res_m3u8_video_path = f"{storage_path}/{encoder_folder}/{content_id}/{lowest_resolution}p.m3u8"
             generate_cc(cs_id, convert_m3u8_to_m4a(
                 low_res_m3u8_video_path), cc_path, panel_version)
         elif vod_type == "mp4":
-            low_res_mp4_video_path = f"{storage_path}/{user_id}/{get_filename(cs_path)}_{lowest_resolution}.mp4"
-            uploaded_video_path = f"{storage_path}/{user_id}/{cs_path}"
+            low_res_mp4_video_path = f"{storage_path}/{encoder_folder}/{get_filename(cs_path)}_{lowest_resolution}.mp4"
+            uploaded_video_path = f"{storage_path}/{encoder_folder}/{cs_path}"
             if os.path.exists(low_res_mp4_video_path):
                 generate_cc(cs_id, low_res_mp4_video_path, cc_path, panel_version)
             elif os.path.exists(uploaded_video_path):
