@@ -265,6 +265,7 @@ def update_cc_status_panel_v2(
     subtitle_file_path=None,
     error_message=None,
     progress_percentage=None,
+    language=None,
 ):
     status_url = f"{base_url}{panel_v2_status_path}"
     payload = {
@@ -274,6 +275,8 @@ def update_cc_status_panel_v2(
     normalized_progress = normalize_progress_percentage(progress_percentage)
     if normalized_progress is not None:
         payload["progress_percentage"] = normalized_progress
+    if language:
+        payload["language"] = str(language)
 
     if payload["status"] == "ready":
         if not subtitle_file_path or not os.path.exists(subtitle_file_path):
@@ -310,6 +313,7 @@ def update_cc_status(
     subtitle_file_path=None,
     error_message=None,
     progress_percentage=None,
+    language=None,
 ):
     resolved_panel_version = resolve_panel_version(panel_version)
     base_url = panel_base_urls.get(
@@ -326,6 +330,7 @@ def update_cc_status(
                 subtitle_file_path=subtitle_file_path,
                 error_message=error_message,
                 progress_percentage=progress_percentage,
+                language=language,
             )
         return update_cc_status_panel_v1(cs_id=cs_id, status=status, base_url=base_url)
     except Exception as panel_error:
@@ -513,7 +518,7 @@ def preload_model():
     return whisper_model
 
 
-def transcribe_with_progress(model, video_path, on_progress=None):
+def transcribe_with_progress(model, video_path, task="transcribe", on_progress=None):
     transcribe_module = importlib.import_module("whisper.transcribe")
     original_tqdm = transcribe_module.tqdm.tqdm
 
@@ -548,7 +553,7 @@ def transcribe_with_progress(model, video_path, on_progress=None):
     try:
         result = model.transcribe(
             video_path,
-            task="transcribe",
+            task=task,
             fp16=False,
             verbose=False,
         )
@@ -560,7 +565,7 @@ def transcribe_with_progress(model, video_path, on_progress=None):
         transcribe_module.tqdm.tqdm = original_tqdm
 
 
-def generate_cc(cs_id, video_path, cc_path, panel_version):
+def generate_cc(cs_id, video_path, cc_path, panel_version, generation_task="transcribe"):
     resolved_panel_version = resolve_panel_version(panel_version)
     update_cc_status(cs_id, "GENERATING", panel_version, progress_percentage=0)
 
@@ -575,7 +580,13 @@ def generate_cc(cs_id, video_path, cc_path, panel_version):
         )
 
     model = preload_model()
-    result = transcribe_with_progress(model, video_path, on_progress=on_progress)
+    normalized_task = "translate" if generation_task == "translate" else "transcribe"
+    result = transcribe_with_progress(
+        model,
+        video_path,
+        task=normalized_task,
+        on_progress=on_progress,
+    )
     if not os.path.exists(os.path.dirname(cc_path)):
         os.makedirs(os.path.dirname(cc_path))
     srt_writer = get_writer(subtitle_type, os.path.dirname(cc_path))
@@ -588,6 +599,7 @@ def generate_cc(cs_id, video_path, cc_path, panel_version):
         panel_version,
         subtitle_file_path=cc_path,
         progress_percentage=100,
+        language="en" if normalized_task == "translate" else result.get("language"),
     )
 
 
@@ -632,6 +644,11 @@ def on_message_callback(ch, method, properties, body):
         cc_path = normalize_path(parsed_body["cc_path"])
         encoder_folder = parsed_body["encoderFolder"]
         panel_version = parsed_body.get("panel_version", panel_version_default)
+        generation_task = (
+            "translate"
+            if str(parsed_body.get("generation_task", "transcribe")).lower() == "translate"
+            else "transcribe"
+        )
 
         if subtitle_file_exists_and_non_empty(cc_path):
             print(
@@ -666,14 +683,14 @@ def on_message_callback(ch, method, properties, body):
         if vod_type == "ts":
             low_res_m3u8_video_path = f"{storage_path}/{encoder_folder}/{content_id}/{lowest_resolution}p.m3u8"
             generate_cc(cs_id, convert_m3u8_to_m4a(
-                low_res_m3u8_video_path), cc_path, panel_version)
+                low_res_m3u8_video_path), cc_path, panel_version, generation_task)
         elif vod_type == "mp4":
             low_res_mp4_video_path = f"{storage_path}/{encoder_folder}/{get_filename(cs_path)}_{lowest_resolution}.mp4"
             uploaded_video_path = f"{storage_path}/{encoder_folder}/{cs_path}"
             if os.path.exists(low_res_mp4_video_path):
-                generate_cc(cs_id, low_res_mp4_video_path, cc_path, panel_version)
+                generate_cc(cs_id, low_res_mp4_video_path, cc_path, panel_version, generation_task)
             elif os.path.exists(uploaded_video_path):
-                generate_cc(cs_id, uploaded_video_path, cc_path, panel_version)
+                generate_cc(cs_id, uploaded_video_path, cc_path, panel_version, generation_task)
             else:
                 print("Error occured: Video file not found")
                 update_cc_status(cs_id, "ERROR", panel_version, error_message="Video file not found")
